@@ -50,7 +50,7 @@ var (
 // It backs efficient responds to
 //   - cloudprovider.NodeGroups() (= registeredNodeGroups)
 //   - cloudprovider.NodeGroupForNode (via azureManager.GetNodeGroupForInstance => FindForInstance,
-//     using instanceToNodeGroup and unownedInstances)
+//     using instances and unownedInstances)
 //
 // CloudProvider.Refresh, called before every autoscaler loop (every 10s by defaul),
 // is implemented by AzureManager.Refresh which makes the cache refresh decision,
@@ -91,25 +91,29 @@ type azureCache struct {
 	// registeredNodeGroups represents all known NodeGroups.
 	registeredNodeGroups []cloudprovider.NodeGroup
 
-	// instanceToNodeGroup maintains a mapping from instance Ids to nodegroups.
-	// It is populated from the results of calling Nodes() on each nodegroup.
-	// It is used (together with unownedInstances) when looking up the nodegroup
-	// for a given instance id (see FindForInstance).
-	instanceToNodeGroup map[azureRef]cloudprovider.NodeGroup
-
-	// instanceStates maintains a mapping from instance Ids to their last known
-	// cloudprovider.InstanceState. It is populated alongside instanceToNodeGroup
-	// from the results of calling Nodes() on each nodegroup. It is used by
+	// instances maintains a mapping from instance Ids to their cached nodegroup
+	// and last known state. It is populated from the results of calling Nodes()
+	// on each nodegroup. It is used (together with unownedInstances) when looking
+	// up the nodegroup for a given instance id (see FindForInstance), and by
 	// HasInstance to not include instances in an active state of deletion.
-	instanceStates map[azureRef]cloudprovider.InstanceState
+	instances map[azureRef]instanceCacheEntry
 
 	// unownedInstance maintains a set of instance ids not belonging to any nodegroup.
-	// It is used (together with instanceToNodeGroup) when looking up the nodegroup for a given instance id.
+	// It is used (together with instances) when looking up the nodegroup for a given instance id.
 	// It is reset by invalidateUnownedInstanceCache().
 	unownedInstances map[azureRef]bool
 
 	autoscalingOptions map[azureRef]map[string]string
 	skus               *skewer.Cache
+}
+
+// instanceCacheEntry holds everything azureCache tracks for a single instance
+// owned by a nodegroup, so that per-instance data cannot drift out of sync.
+type instanceCacheEntry struct {
+	nodeGroup cloudprovider.NodeGroup
+	// state is the last known state of the instance. The zero value means the
+	// state is unknown (the instance was listed without a Status).
+	state cloudprovider.InstanceState
 }
 
 func newAzureCache(client *azClient, cacheTTL time.Duration, config Config) (*azureCache, error) {
@@ -132,8 +136,7 @@ func newAzureCache(client *azClient, cacheTTL time.Duration, config Config) (*az
 		scaleSets:            make(map[string]*armcompute.VirtualMachineScaleSet),
 		virtualMachines:      make(map[string][]*armcompute.VirtualMachine),
 		registeredNodeGroups: make([]cloudprovider.NodeGroup, 0),
-		instanceToNodeGroup:  make(map[azureRef]cloudprovider.NodeGroup),
-		instanceStates:       make(map[azureRef]cloudprovider.InstanceState),
+		instances:            make(map[azureRef]instanceCacheEntry),
 		unownedInstances:     make(map[azureRef]bool),
 		autoscalingOptions:   make(map[azureRef]map[string]string),
 		skus:                 &skewer.Cache{}, // populated iff config.EnableDynamicInstanceList
@@ -197,8 +200,7 @@ func (m *azureCache) regenerate() error {
 	}
 
 	// Regenerate instance to node groups mapping.
-	newInstanceToNodeGroupCache := make(map[azureRef]cloudprovider.NodeGroup)
-	newInstanceStates := make(map[azureRef]cloudprovider.InstanceState)
+	newInstances := make(map[azureRef]instanceCacheEntry)
 	for _, ng := range m.registeredNodeGroups {
 		klog.V(4).Infof("regenerate: finding nodes for node group %s", ng.Id())
 		instances, err := ng.Nodes(context.TODO())
@@ -208,11 +210,11 @@ func (m *azureCache) regenerate() error {
 		klog.V(4).Infof("regenerate: found %d nodes for node group %s: %+v", len(instances), ng.Id(), instances)
 
 		for _, instance := range instances {
-			ref := azureRef{Name: instance.Id}
-			newInstanceToNodeGroupCache[ref] = ng
+			entry := instanceCacheEntry{nodeGroup: ng}
 			if instance.Status != nil {
-				newInstanceStates[ref] = instance.Status.State
+				entry.state = instance.Status.State
 			}
+			newInstances[azureRef{Name: instance.Id}] = entry
 		}
 	}
 
@@ -230,8 +232,7 @@ func (m *azureCache) regenerate() error {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 
-	m.instanceToNodeGroup = newInstanceToNodeGroupCache
-	m.instanceStates = newInstanceStates
+	m.instances = newInstances
 	m.autoscalingOptions = newAutoscalingOptions
 
 	// Reset unowned instances cache.
@@ -479,16 +480,10 @@ func (m *azureCache) HasInstance(providerID string) (bool, error) {
 		return false, err
 	}
 
-	// A single pass over instanceToNodeGroup locates the instance. The matched key
-	// also indexes instanceStates, which setInstanceStateByProviderID keeps aligned
-	// with instanceToNodeGroup, so the state can be retrieved with a direct lookup.
-	for instanceID := range m.instanceToNodeGroup {
-		if !strings.EqualFold(instanceID.GetKey(), resourceID) {
-			continue
-		}
+	if _, entry, found := m.findInstanceEntry(resourceID); found {
 		// An instance that is actively being deleted is reported as gone so that
 		// ClusterStateRegistry stops counting it as an upcoming node.
-		if state, found := m.instanceStates[instanceID]; found && state == cloudprovider.InstanceDeleting {
+		if entry.state == cloudprovider.InstanceDeleting {
 			return false, nil
 		}
 		return true, nil
@@ -540,7 +535,7 @@ func (m *azureCache) FindForInstance(instance *azureRef, vmType string) (cloudpr
 	}
 
 	// Look up caches for the instance.
-	klog.V(6).Infof("FindForInstance: attempting to retrieve instance %v from cache", m.instanceToNodeGroup)
+	klog.V(6).Infof("FindForInstance: attempting to retrieve instance %v from cache", m.instances)
 	if nodeGroup := m.getInstanceFromCache(inst.Name); nodeGroup != nil {
 		klog.V(4).Infof("FindForInstance: found node group %q in cache", nodeGroup.Id())
 		return nodeGroup, nil
@@ -564,13 +559,23 @@ func (m *azureCache) areAllScaleSetsUniform() bool {
 // getInstanceFromCache gets the node group from cache. Returns nil if not found.
 // Should be called with lock.
 func (m *azureCache) getInstanceFromCache(providerID string) cloudprovider.NodeGroup {
-	for instanceID, nodeGroup := range m.instanceToNodeGroup {
-		if strings.EqualFold(instanceID.GetKey(), providerID) {
-			return nodeGroup
-		}
+	if _, entry, found := m.findInstanceEntry(providerID); found {
+		return entry.nodeGroup
 	}
 
 	return nil
+}
+
+// findInstanceEntry returns the key and cache entry of the instance matching
+// providerID (case-insensitively). Should be called with lock.
+func (m *azureCache) findInstanceEntry(providerID string) (azureRef, instanceCacheEntry, bool) {
+	for instanceID, entry := range m.instances {
+		if strings.EqualFold(instanceID.GetKey(), providerID) {
+			return instanceID, entry, true
+		}
+	}
+
+	return azureRef{}, instanceCacheEntry{}, false
 }
 
 // setInstanceStateByProviderID records the last known InstanceState for the given
@@ -585,10 +590,8 @@ func (m *azureCache) setInstanceStateByProviderID(providerID string, state cloud
 		return
 	}
 
-	for instanceID := range m.instanceToNodeGroup {
-		if strings.EqualFold(instanceID.GetKey(), resourceID) {
-			m.instanceStates[instanceID] = state
-			return
-		}
+	if instanceID, entry, found := m.findInstanceEntry(resourceID); found {
+		entry.state = state
+		m.instances[instanceID] = entry
 	}
 }
